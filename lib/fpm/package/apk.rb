@@ -7,6 +7,7 @@ require "backports/latest"
 require "fileutils"
 require "digest"
 require 'digest/sha1'
+require 'openssl'
 
 # Support for Alpine packages (.apk files)
 #
@@ -83,11 +84,11 @@ class FPM::Package::APK< FPM::Package
 
     datatar_path = create_data_tar
     controltar_path = create_control_tar(datatar_path)
+    signature_tar_path = create_signature_tar(controltar_path)
 
-    concat_zip_tars(controltar_path, datatar_path, output_path)
+    concat_zip_tars([signature_tar_path, controltar_path, datatar_path], output_path)
 
-    logger.warn("apk output does not currently sign packages.")
-    logger.warn("It's recommended that your package be installed with '--allow-untrusted'")
+    logger.warn("Import the public key matching the private key used to sign the package or install the package with '--allow-untrusted'")
   end
 
   def write_pkginfo(base_path, datahash)
@@ -100,13 +101,12 @@ class FPM::Package::APK< FPM::Package
     pkginfo << "pkgdesc = #{description()}\n"
     pkginfo << "url = #{url()}\n"
     pkginfo << "size = 102400\n" # totally magic, not sure what it's used for.
+    pkginfo << "datahash = #{datahash}\n"
 
     # write depends lines
     for dependency in dependencies()
       pkginfo << "depend = #{dependency}\n"
     end
-
-    pkginfo << "datahash = #{datahash}\n"
 
     File.write("#{base_path}/.PKGINFO", pkginfo)
   end
@@ -140,6 +140,43 @@ class FPM::Package::APK< FPM::Package
 
     controltar_path
   end
+
+  # TODO: Accept key args as CLI arg
+  def create_signature_tar(control_tar_path)
+  signature_tar_path = build_path("control.tar")
+  key_name = 'contact@opennebula.io-5261cecb' # PoC
+  private_key_path = '/root/private_key.pem' # PoC
+
+  # Generate SHA1 hash of the control tar segment gzip stream
+  control_tar_data = File.read(control_tar_path)
+  sha1_hash = OpenSSL::Digest::SHA1.digest(control_tar_data)
+
+  # Create DER-encoded PKCS1v15 RSA signature
+  private_key = OpenSSL::PKey::RSA.new(File.read(private_key_path))
+  signature = private_key.sign(OpenSSL::Digest.new('SHA1'), sha1_hash)
+
+  # Create tar record with the signature file
+  signature_filename = ".SIGN.RSA.#{key_name}.rsa.pub"
+  tar_data = StringIO.new
+  ::Gem::Package::TarWriter.new(tar_data) do |tar|
+    tar.add_file(signature_filename, 0644) do |io|
+      io.write(signature)
+    end
+  end
+  tar_data.rewind
+
+  # Gzip compress the tar record
+  compressed_data = StringIO.new
+  Zlib::GzipWriter.wrap(compressed_data) do |gz|
+    gz.write(tar_data.read)
+  end
+  compressed_data.rewind
+
+  signature_tar_data = StringIO.new(compressed_data.string)
+  File.write(signature_tar_path, signature_tar_data.read)
+
+  signature_tar_path
+end
 
   # Writes each control script from template into the build path,
   # in the folder given by [base_path]
@@ -297,38 +334,25 @@ class FPM::Package::APK< FPM::Package
   end
 
   # Concatenates each of the given [apath] and [bpath] into the given [target_path]
-  def concat_zip_tars(apath, bpath, target_path)
-
-    temp_apath = apath + "~"
-    temp_bpath = bpath + "~"
-
-    # zip each path separately
-    Zlib::GzipWriter.open(temp_apath) do |target_writer|
-      open(apath, "rb") do |file|
-        until(file.eof?())
-          target_writer.write(file.read(4096))
+  def concat_zip_tars(paths, target_path)
+    paths.each do |path|
+      # zip each path separately
+      Zlib::GzipWriter.open("#{path}~") do |target_writer|
+        open(path, "rb") do |file|
+          until(file.eof?())
+            target_writer.write(file.read(4096))
+          end
         end
       end
     end
 
-    Zlib::GzipWriter.open(temp_bpath) do |target_writer|
-      open(bpath, "rb") do |file|
-        until(file.eof?())
-          target_writer.write(file.read(4096))
-        end
-      end
-    end
-
-    # concat both into one.
+    # concat each into one.
     File.open(target_path, "wb") do |target_writer|
-      open(temp_apath, "rb") do |file|
-        until(file.eof?())
-          target_writer.write(file.read(4096))
-        end
-      end
-      open(temp_bpath, "rb") do |file|
-        until(file.eof?())
-          target_writer.write(file.read(4096))
+      paths.each do |path|
+        open("#{path}~", "rb") do |file|
+          until(file.eof?())
+            target_writer.write(file.read(4096))
+          end
         end
       end
     end
